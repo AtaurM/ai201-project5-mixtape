@@ -46,3 +46,83 @@ Note that the same "act on a song, notify the sharer" shape shows up for ratings
 - **Serialization lives on the model.** `to_dict()` methods on each model are the only serialization path; services and routes just call them rather than building response dicts by hand.
 - **IDs are UUID strings everywhere**, generated in Python via `generate_uuid()` rather than relying on autoincrementing integer primary keys.
 - **Association tables carry metadata when the relationship needs it.** `playlist_entries` has `position`/`added_by`/`added_at`; `friendships` and `song_tags` are bare join tables since there's nothing extra to track for those relationships.
+
+## Bug reproduction notes (before any fixes)
+
+Setup:
+
+```bash
+python seed_data.py
+FLASK_APP=app:create_app flask run
+```
+
+Then look up real IDs to plug into the requests below, since every endpoint needs a UUID:
+
+```bash
+curl http://127.0.0.1:5000/songs/search?q=a
+```
+
+The response includes `id` and `shared_by` for every song. Cross-reference `shared_by` against `GET /users/<id>` if you need a username. From the seeded data, I used `nova` as a song sharer and `darius` as a second user, and one of nova's playlists.
+
+**Issue 4, notified on playlist add but not on rating.** Checked the sharer's notification count, rated one of their songs as a different user, then checked again.
+
+```bash
+curl http://127.0.0.1:5000/users/<nova_id>/notifications
+# {"count":1, ...}
+
+curl -X POST http://127.0.0.1:5000/songs/<song_id>/rate \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "<darius_id>", "score": 5}'
+# {"id":"...", "score":5, ...}  <- the rating was created
+
+curl http://127.0.0.1:5000/users/<nova_id>/notifications
+# {"count":1, ...}  <- unchanged, no new notification for the sharer
+```
+
+The rating call succeeds and returns a real rating record, but the sharer's notification count doesn't move. Compare this against adding a song to a playlist (`POST /playlists/<id>/songs`), which does bump the sharer's count by one, to see the asymmetry directly.
+
+**Issue 5, last playlist song never shows up.** Compared the playlist's own metadata against what the songs endpoint returns.
+
+```bash
+curl http://127.0.0.1:5000/playlists/<playlist_id>
+# {"name": "Late Night Vibes", ...}
+
+curl http://127.0.0.1:5000/playlists/<playlist_id>/songs
+# {"count": 6, "songs": [...]}
+```
+
+Seed data puts 7 songs in this playlist (confirmed by counting the insert statements in `seed_data.py` for that playlist), but the endpoint reports 6. Adding one more song with `POST /playlists/<playlist_id>/songs` and re-checking the count shows it still comes up one short of what was actually added.
+
+**Issue 2, feed shows people from yesterday.** The `/songs/<id>/listen` route always stamps the event with the server's current time, there's no way to submit a past timestamp through the API. So a live repro needs one setup step outside the API: pick a friend, keep exactly one of their listening events, and set that event's `listened_at` back by 20 hours (done with a short script against the same database, not through any route, since the app itself has no "backdate" feature). That step simulates a real friend whose last listen genuinely happened 20 hours ago:
+
+```bash
+curl http://127.0.0.1:5000/feed/<nova_id>/listening-now
+```
+
+With darius's only remaining event 20 hours old, dated the previous calendar day relative to "now," he still showed up in the feed response, tagged with yesterday's date in `listened_at`. The 24-hour rolling window doesn't care that the event crossed midnight, it only checks elapsed hours.
+
+**Issue 1, streak resets.** Same limitation as Issue 2: `/songs/<id>/listen` always uses the real current server time, and the buggy comparison only misfires when the request actually lands on a Sunday. There's no way to fake "today is Sunday" through the API without changing the system clock, which I didn't want to do since it affects the whole machine, not just this app. The reproducible curl procedure is:
+
+```bash
+# On a Saturday:
+curl -X POST http://127.0.0.1:5000/songs/<song_id>/listen \
+  -H "Content-Type: application/json" -d '{"user_id": "<user_id>"}'
+
+# On the following Sunday:
+curl -X POST http://127.0.0.1:5000/songs/<song_id>/listen \
+  -H "Content-Type: application/json" -d '{"user_id": "<user_id>"}'
+
+curl http://127.0.0.1:5000/users/<user_id>/streak
+```
+
+Run for real on those two days, the streak should read 2 and instead reads 1. Since I can't wait for a real Saturday-to-Sunday transition to write this up, I cross-checked the same logic by calling `update_listening_streak` directly with constructed dates spanning a Saturday into a Sunday: streak climbed 1 through 6 across a full week, Monday through Saturday, then dropped back to 1 on Sunday instead of continuing to 7, confirming the same code path fails specifically on that boundary regardless of how the date is supplied.
+
+**Issue 3, duplicate search results.** Tried this one the same way as the others:
+
+```bash
+curl "http://127.0.0.1:5000/songs/search?q=Crown"
+```
+
+against a song seeded with three tags. It came back with `"count":1`, one result, not three. I checked whether the join underneath is actually fanning out by running the equivalent SQL directly against the same database outside the app: it returns 3 duplicate rows, one per tag, confirming the join itself is still wrong. But the ORM call search_service.py makes on top of that join (`session.query(Song)...all()`) is deduplicating full-entity rows by primary key before the route ever serializes a response, on the pinned SQLAlchemy version (2.0.51). `tests/test_search.py` also passes as-is, consistent with what curl showed. I'm flagging this one as not reproducible through the running app in this environment rather than counting it as one of the three to fix, unless further digging turns up a path that does surface the duplicates in the actual JSON response.
+
+Based on this, issues 1, 2, 4, and 5 reproduce cleanly through the running server. Issue 3 does not reproduce in an actual HTTP response in this environment, so it needs more investigation before deciding whether to count it toward the fix total.
