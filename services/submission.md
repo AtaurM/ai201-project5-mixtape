@@ -1,10 +1,24 @@
-# Mixtape Codebase Map
+# Mixtape Bug Hunt — Submission
 
-## Overview
+## AI usage
+
+I used Claude Code to help me understand and diagnose and verified each claim as we went through each milestone step.
+
+**Codebase navigation.** Before touching any issue, I had it read every file in `app.py`, `models.py`, `routes/`, and `services/` and asked it to explain what each module was responsible for and how a request actually flows end to end, specifically "trace how adding a song to a playlist ends up creating a notification." It walked the call chain from the route through `add_to_playlist` to `create_notification`, which became the data-flow example in the codebase map below. This was read-only, no diagnosis involved, just building an accurate mental model before opening any bug.
+
+**Reproduction before any fix.** For each of the five issues, I had it reproduce the reported behavior against the actual running server (curl against `flask run`) or, where the API had no way to construct the needed state, a small script hitting the same database directly, before writing or changing any code. This mattered most for Issue 3: the AI's first attempt to reproduce the duplicate-search bug through the normal `search_songs()` call came back with exactly one result, not three. Rather than accepting "no bug here," it dropped to raw SQL against the same connection to check whether the underlying join was actually fanning out. It was, three duplicate rows, confirming the bug was real at the SQL level but was being silently deduplicated by an ORM version behavior before ever reaching the JSON response. If I'd taken the first negative result at face value, I would have wrongly concluded that issue didn't need fixing.
+
+**Root cause diagnosis.** For Issue 4 in particular, I asked it to compare `add_to_playlist` and `rate_song` in `notification_service.py` side by side, since both should notify a song's sharer but only one did. The useful move here was structural comparison of two similar functions rather than staring at one function in isolation, it surfaced that `rate_song` was missing an entire step, not a broken condition.
+
+**Where I double-checked instead of trusting the explanation.** I reran the test suite after each fix. For the streak fix (Issue 1) and the feed fix (Issue 2), both involve date/time boundaries I couldn't fully exercise through the live server on the actual day I was working, so I had it cross-check the same logic through direct function calls with constructed dates alongside the curl-based procedure, and I compared the two to make sure they agreed rather than relying on either alone. For Issue 5, I specifically asked for a one-song playlist boundary case in addition to the reported multi-song case, since an off-by-one fix that only gets tested against the reported scenario is exactly the kind of thing that can still be wrong at the edges.
+
+## Codebase map
+
+### Overview
 
 Mixtape is a small Flask app for sharing songs with friends, rating them, building collaborative playlists, and tracking listening streaks. It's organized in three layers: `routes/` (HTTP), `services/` (business logic), and `models.py` (data shape). No FE; just JSON returned by each route.
 
-## Main files
+### Main files
 
 **app.py** holds the application builder, `create_app()`. It builds the Flask app, configures a SQLite database (overridable via a `DATABASE_URL` env var), initializes the shared `db = SQLAlchemy()` instance, and registers the four blueprints under `/songs`, `/playlists`, `/users`, and `/feed`. It also calls `db.create_all()` on startup, so there's no separate migration step for local dev.
 
@@ -26,7 +40,7 @@ Mixtape is a small Flask app for sharing songs with friends, rating them, buildi
 
 **tests/** has three files, `test_playlists.py`, `test_search.py`, `test_streaks.py`, each exercising one service module against a fresh app/db fixture.
 
-## Data flow: adding a song to a playlist triggers a notification
+### Data flow: adding a song to a playlist triggers a notification
 
 1. Client calls `POST /playlists/<playlist_id>/songs` with `song_id` and `added_by` in the body.
 2. `routes/playlists.py:add_song` pulls those two fields out of the request and, if both are present, calls `add_to_playlist(playlist_id, song_id, added_by)` from `services/notification_service.py`.
@@ -36,9 +50,9 @@ Mixtape is a small Flask app for sharing songs with friends, rating them, buildi
 6. `create_notification` builds a `Notification` row addressed to the original sharer and commits it.
 7. Later, the sharer fetches `GET /users/<user_id>/notifications`, which calls `get_notifications` in the same service, ordered newest-first, optionally filtered to unread only. A separate `POST /users/notifications/<id>/read` flips the `read` flag via `mark_as_read`.
 
-Note that the same "act on a song, notify the sharer" shape shows up for ratings too: `rate_song` also lives in `notification_service.py` even though today it only writes the `Rating` row and doesn't call `create_notification` itself. The module groups by "who's affected," not by which table gets written.
+Note that the same "act on a song, notify the sharer" shape shows up for ratings too: `rate_song` also lives in `notification_service.py`, alongside `add_to_playlist`, rather than in a plain CRUD-style module. The module groups by "who's affected by an action on a song," not by which table gets written.
 
-## Patterns
+### Patterns
 
 - **Routes are minimal, services hold logic.** Every blueprint handler parses input and formats output; the actual work (lookups, validation, writes, cross-entity effects) is in `services/`. This makes the services independently testable, which is exactly what `tests/` does.
 - **Validation via exceptions, not return codes.** Services raise `ValueError` with a human-readable message on any bad ID or invalid input; routes catch it and turn it into a 400 or 404 depending on context. There's no shared exception type per error class, just the message string.
@@ -168,6 +182,8 @@ Based on this, issues 1, 2, 4, and 5 reproduce cleanly through the running serve
 **The root cause:** `rate_song` was simply never given the notification step that `add_to_playlist` has. It's architectural, not a typo, an off-by-one, or a wrong condition: the function is missing an entire step that its sibling function in the same file already implements for a structurally identical situation (a friend acting on a song you shared). The fix has to add that step, not correct an existing one.
 
 **My fix and side-effect check:** Added the same "don't notify yourself" guarded call to `create_notification` at the end of `rate_song`, after the commit, mirroring `add_to_playlist`'s pattern: notify `song.shared_by` with a `"song_rated"` type and a message naming the rater, the song, and the score, but only if `user_id != song.shared_by`. Reran the reproduction steps: rating as a different user now increments the sharer's notification count by one. Also checked two adjacent cases: re-rating the same song (the `existing` update path in `rate_song`) still fires a fresh notification each time, consistent with `add_to_playlist` notifying on every add rather than only the first; and a user rating their own shared song does not generate a self-notification, matching the existing guard behavior for playlist adds. Ran the full test suite: no new failures, same two pre-existing `test_playlists.py` failures for Issue 5.
+
+**Regression test:** `tests/test_notifications.py::test_rating_a_song_notifies_the_sharer` seeds a sharer and a second user, rates the sharer's song as that second user, and asserts the sharer's notification count went up by one and that the new notification's type is `"song_rated"`. I checked out `services/notification_service.py` from the commit before this fix and reran just this test against it: it failed with `assert 0 == (0 + 1)`, the exact symptom from the bug report, confirming the test would have caught this regression before the fix existed. A second test in the same file, `test_rating_your_own_song_does_not_self_notify`, guards the adjacent case so a future fix can't "solve" the missing notification by removing the self-notification check instead.
 
 ### Issue 5: The last song in a playlist never shows up
 
