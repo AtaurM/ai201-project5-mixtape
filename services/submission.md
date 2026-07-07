@@ -126,3 +126,15 @@ curl "http://127.0.0.1:5000/songs/search?q=Crown"
 against a song seeded with three tags. It came back with `"count":1`, one result, not three. I checked whether the join underneath is actually fanning out by running the equivalent SQL directly against the same database outside the app: it returns 3 duplicate rows, one per tag, confirming the join itself is still wrong. But the ORM call search_service.py makes on top of that join (`session.query(Song)...all()`) is deduplicating full-entity rows by primary key before the route ever serializes a response, on the pinned SQLAlchemy version (2.0.51). `tests/test_search.py` also passes as-is, consistent with what curl showed. I'm flagging this one as not reproducible through the running app in this environment rather than counting it as one of the three to fix, unless further digging turns up a path that does surface the duplicates in the actual JSON response.
 
 Based on this, issues 1, 2, 4, and 5 reproduce cleanly through the running server. Issue 3 does not reproduce in an actual HTTP response in this environment, so it needs more investigation before deciding whether to count it toward the fix total.
+
+## Root cause analysis
+
+### Issue 1: My listening streak keeps resetting
+
+**How I reproduced it:** Called `update_listening_streak` with constructed dates for ten consecutive days starting on a Monday (see reproduction notes above; a live curl repro needs a real Saturday-to-Sunday pair of days since the `/listen` route always uses server "now"). The streak climbed 1 through 6 correctly Monday through Saturday, then dropped to 1 on Sunday instead of continuing to 7.
+
+**How I found the root cause:** Opened `services/streak_service.py` and read `update_listening_streak` top to bottom. The three branches are: same day (no-op), one day since last listen (increment), anything else (reset to 1). The increment branch read `elif days_since_last == 1 and today.weekday() != 6`. That extra clause was the only thing distinguishing Sunday from every other day, and it directly matched the bug report's timing.
+
+**The root cause:** Python's `date.weekday()` returns 6 for Sunday. The increment branch required `days_since_last == 1` *and* `today.weekday() != 6`, so a listen on Sunday, even one day after a Saturday listen, always failed the second condition and fell through to the `else` branch, which resets the streak to 1. The condition had nothing to do with whether the streak was actually consecutive, it just special-cased Sunday out of the one legitimate increment path.
+
+**My fix and side-effect check:** Removed `and today.weekday() != 6`, leaving `elif days_since_last == 1:` as the sole condition for incrementing. Reran the same ten-day simulation; the streak now goes 1 through 10 without interruption across the Sunday boundary. Ran the full test suite afterward: `tests/test_streaks.py` passes, and the only failures are the two pre-existing `test_playlists.py` failures tied to Issue 5, unrelated to this change.
